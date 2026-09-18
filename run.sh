@@ -14,12 +14,14 @@ source /etc/os-release
 [[ "${ID:-}" == ubuntu ]] || die "Ubuntu only."
 
 case "$(uname -m)" in
-  x86_64) ARCH=amd64 ;;
-  aarch64|arm64) ARCH=arm64 ;;
+  x86_64) ARCH=amd64; LG_ARCH=x86_64 ;;
+  aarch64|arm64) ARCH=arm64; LG_ARCH=arm64 ;;
   *) die "Unsupported architecture: $(uname -m)" ;;
 esac
 
-sudo -v
+# sudo -v 在 sudo-rs（Ubuntu 26.04 默认）下只要命中任何一条非 NOPASSWD 规则（如 %sudo）就要密码，
+# 而云主机默认用户没有密码；先试免密，失败再交互。
+sudo -n true 2>/dev/null || sudo -v || die "sudo is not usable for $(id -un)."
 log "Ubuntu: ${PRETTY_NAME}; architecture: ${ARCH}"
 sudo apt-get update -y
 
@@ -33,7 +35,7 @@ apt_pkg() {
 }
 
 log "Base packages"
-for p in ca-certificates curl wget unzip zip tar gzip xz-utils gnupg jq rsync lsof build-essential ncurses-bin git openjdk-21-jdk mysql-client postgresql-client neovim btop; do
+for p in ca-certificates curl wget unzip zip tar gzip xz-utils gnupg jq rsync lsof build-essential ncurses-bin git tmux mosh openjdk-21-jdk mysql-client postgresql-client neovim btop; do
   apt_pkg "$p"
 done
 
@@ -69,9 +71,30 @@ if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
 fi
 # shellcheck disable=SC1090
 . "$NVM_DIR/nvm.sh"
+# nvm 与 ~/.npmrc 里的 prefix/globalconfig 不兼容（nvm use 直接返回 11）
+if [[ -f "$HOME/.npmrc" ]] && grep -qE '^[[:space:]]*(prefix|globalconfig)[[:space:]]*=' "$HOME/.npmrc"; then
+  cp "$HOME/.npmrc" "$HOME/.npmrc.bak.$(date +%s)"
+  sed -i -E '/^[[:space:]]*(prefix|globalconfig)[[:space:]]*=/d' "$HOME/.npmrc"
+  ok "Removed prefix/globalconfig from ~/.npmrc (backup kept)"
+fi
 nvm install --lts
 nvm alias default 'lts/*'
 nvm use default
+
+log "pi coding agent"
+# https://github.com/earendil-works/pi — installs into the nvm-managed Node
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+log "herdr"
+# https://github.com/herdrdev/herdr — official installer, puts the binary in ~/.local/bin
+curl -fsSL https://herdr.dev/install.sh | sh
+
+log "mosh firewall"
+if command -v ufw >/dev/null && sudo ufw status | grep -q '^Status: active'; then
+  sudo ufw allow 60000:61000/udp
+else
+  ok "ufw not active; if the provider has a cloud firewall, open UDP 60000-61000 for mosh"
+fi
 
 log "Docker CE"
 if command -v docker >/dev/null; then
@@ -84,8 +107,8 @@ if command -v docker >/dev/null; then
 else
   curl -fsSL https://get.docker.com | sudo sh
 fi
-if getent group docker >/dev/null && ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-  sudo usermod -aG docker "$USER"
+if getent group docker >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx docker; then
+  sudo usermod -aG docker "$(id -un)"
   DOCKER_RELOGIN=1
 fi
 
@@ -105,14 +128,14 @@ fi
 
 log "Alibaba Cloud CLI"
 # Official installer installs/updates the CLI and detects Linux architecture.
-bash -c "$(curl -fsSL https://aliyuncli.alicdn.com/install.sh)"
+sudo bash -c "$(curl -fsSL https://aliyuncli.alicdn.com/install.sh)"
 
 log "lazygit latest"
 LG_LATEST="$(curl -fsSL https://api.github.com/repos/jesseduffield/lazygit/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
 LG_CURRENT="$(lazygit --version 2>/dev/null | grep -oE 'version=[^,]+' | cut -d= -f2 || true)"
 if [[ "$LG_CURRENT" != "$LG_LATEST" ]]; then
   tmp="$(mktemp -d)"
-  curl -fL "https://github.com/jesseduffield/lazygit/releases/download/v${LG_LATEST}/lazygit_${LG_LATEST}_Linux_${ARCH}.tar.gz" -o "$tmp/lazygit.tgz"
+  curl -fL "https://github.com/jesseduffield/lazygit/releases/download/v${LG_LATEST}/lazygit_${LG_LATEST}_linux_${LG_ARCH}.tar.gz" -o "$tmp/lazygit.tgz"
   tar -xzf "$tmp/lazygit.tgz" -C "$tmp" lazygit
   sudo install -m 0755 "$tmp/lazygit" /usr/local/bin/lazygit
   rm -rf "$tmp"
@@ -226,6 +249,10 @@ psql --version
 nvim --version | head -1
 lazygit --version
 btop --version | head -1
+tmux -V
+mosh --version 2>&1 | head -1
+pi --version
+herdr --version
 
 printf '\n✓ VPS setup complete.\n'
 if [[ "${DOCKER_RELOGIN:-0}" == 1 ]]; then
